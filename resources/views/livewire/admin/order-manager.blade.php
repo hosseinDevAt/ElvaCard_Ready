@@ -108,7 +108,7 @@
                     <div><span class="text-slate-400">پلاک:</span> <span class="text-slate-900 font-medium">{{ $selectedOrder->shipping_plaque ?? '—' }}</span></div>
                     <div><span class="text-slate-400">توضیح تحویل:</span> <span class="text-slate-900 font-medium">{{ $selectedOrder->shipping_description ?? '—' }}</span></div>
                     <div>
-                        <span class="text-slate-400">یادداشت سفارش:</span>
+                        <span class="text-slate-400">یادداشت سفارش:</span> 
                         <span class="font-bold {{ filled($selectedOrder->notes) ? 'text-amber-700' : 'text-slate-400' }}">{{ $selectedOrder->notes ?: '—' }}</span>
                     </div>
                 </div>
@@ -178,8 +178,8 @@
                                     $formattedPan = $item->getFormattedDecryptedPan() ?? ($fullPan ? \App\Services\Customization\CardPresenter::presentCardNumber($fullPan) : ($item->getMaskedPan() ?? 'ثبت نشده'));
                                     $decryptedCvv = $item->getDecryptedCvv();
                                     $displayCvv = $decryptedCvv ?: ($custom['cvv2'] ?? ($custom['cvv'] ?? null));
-                                    $formattedExpiry = (!empty($custom['expiry_month']) && !empty($custom['expiry_year']))
-                                        ? (str_pad((string)$custom['expiry_month'], 2, '0', STR_PAD_LEFT) . '/' . substr((string)$custom['expiry_year'], -2))
+                                    $formattedExpiry = (!empty($custom['expiry_month']) && !empty($custom['expiry_year'])) 
+                                        ? (str_pad((string)$custom['expiry_month'], 2, '0', STR_PAD_LEFT) . '/' . substr((string)$custom['expiry_year'], -2)) 
                                         : (!empty($custom['expiry']) ? $custom['expiry'] : null);
                                     $colorName = mb_strtolower($item->color_name_snapshot ?? '');
                                     $itemColorHex = $item->color?->code_hex ?? null;
@@ -838,7 +838,7 @@
                                     @if (isset($payment->metadata['reviewed_by'], $payment->metadata['reviewed_at']))
                                         توسط #{{ $payment->metadata['reviewed_by'] }} در {{ jalali_date($payment->metadata['reviewed_at'], 'datetime') }}
                                     @else
-                                        —
+                                        — 
                                     @endif
                                 </div>
                             </div>
