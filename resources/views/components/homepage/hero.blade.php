@@ -1,0 +1,38 @@
+@php
+    $settings = is_array($section->settings) ? $section->settings : [];
+@endphp
+
+<section class="relative min-h-[40vh] sm:min-h-[60vh] lg:min-h-[70vh] flex items-center justify-center overflow-hidden"
+         style="background-color: {{ $settings['background_color'] ?? '#1a1a2e' }};">
+    <div class="absolute inset-0 bg-gradient-to-b from-black/50 via-black/20 to-transparent"></div>
+
+    @if ($settings['background_image'] ?? false)
+        <img src="{{ asset('storage/' . $settings['background_image']) }}"
+             alt=""
+             class="absolute inset-0 w-full h-full object-cover opacity-30">
+    @endif
+
+    <div class="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-14 sm:py-20 text-center">
+        @if ($section->title)
+            <h1 class="text-4xl sm:text-5xl lg:text-6xl font-bold text-white mb-6 leading-tight">
+                {{ $section->title }}
+            </h1>
+        @endif
+
+        @if ($section->content)
+            <p class="text-xl sm:text-2xl text-white/90 mb-10 max-w-3xl mx-auto leading-relaxed">
+                {{ $section->content }}
+            </p>
+        @endif
+
+        @if (isset($settings['cta_text']) && isset($settings['cta_url']))
+            <a href="{{ safe_url($settings['cta_url']) ?? '#' }}"
+               class="inline-flex items-center gap-2 px-8 py-3.5 text-base sm:text-lg font-bold text-[#010619] bg-[#ffde5b] rounded-xl hover:bg-[#f5d347] hover:scale-[1.02] active:scale-[0.98] transition-all duration-200 shadow-xl shadow-[#ffde5b]/25">
+                <span>{{ $settings['cta_text'] }}</span>
+                @if ($settings['cta_icon'] ?? false)
+                    <x-icons.arrow-left class="w-5 h-5" />
+                @endif
+            </a>
+        @endif
+    </div>
+</section>

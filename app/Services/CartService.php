@@ -1,0 +1,711 @@
+<?php
+
+namespace App\Services;
+
+use App\Enums\CustomizationWorkflowEnum;
+use App\Enums\DesignImageLayoutModeEnum;
+use App\Enums\OrderStatusEnum;
+use App\Enums\PaymentStatusEnum;
+use App\Exceptions\CartPriceChangedException;
+use App\Models\Design;
+use App\Models\DesignColorCompatibility;
+use App\Models\DesignImage;
+use App\Models\Order;
+use App\Models\OrderItem;
+use App\Models\Product;
+use App\Models\ProductColorPrice;
+use App\Models\User;
+use App\Services\BankCard\BankCardCustomization;
+use App\Services\CustomDesign\CustomDesignService;
+use App\Services\Customization\CustomizationWorkflowRegistry;
+use App\Services\FuelCard\FuelCardCustomization;
+use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use InvalidArgumentException;
+
+class CartService
+{
+    private const SESSION_KEY = 'cart';
+
+    private const MAX_QUANTITY = 20;
+
+    public function getCart(): array
+    {
+        $cart = session(self::SESSION_KEY, ['items' => []]);
+
+        if (! is_array($cart) || ! isset($cart['items']) || ! is_array($cart['items'])) {
+            $cart = ['items' => []];
+        }
+
+        $cart['items'] = array_values($cart['items']);
+        $cart['total_quantity'] = array_sum(array_map(fn (array $item) => (int) ($item['quantity'] ?? 0), $cart['items']));
+        $cart['total_price'] = array_sum(array_map(fn (array $item) => (int) ($item['final_price'] ?? 0), $cart['items']));
+
+        return $cart;
+    }
+
+    public function addItem(array $payload): array
+    {
+        $validated = $this->validatePayload($payload);
+        $cart = $this->getCart();
+
+        $existingIndex = $this->findDuplicateItemIndex($cart['items'], $validated);
+
+        if ($existingIndex !== null) {
+            $newQuantity = min((int) $cart['items'][$existingIndex]['quantity'] + $validated['quantity'], self::MAX_QUANTITY);
+            $cart['items'][$existingIndex]['quantity'] = $newQuantity;
+            $cart['items'][$existingIndex]['unit_price_snapshot'] = $validated['unit_price_snapshot'];
+            $cart['items'][$existingIndex]['final_price'] = $newQuantity * $validated['unit_price_snapshot'];
+            $cart['items'][$existingIndex]['customization_json'] = $validated['customization_json'];
+            $cart['items'][$existingIndex]['product_name_snapshot'] = $validated['product_name_snapshot'];
+            $cart['items'][$existingIndex]['color_name_snapshot'] = $validated['color_name_snapshot'];
+            $cart['items'][$existingIndex]['design_name_snapshot'] = $validated['design_name_snapshot'];
+            $cart['items'][$existingIndex]['design_image_path_snapshot'] = $validated['design_image_path_snapshot'];
+            $cart['items'][$existingIndex]['layout_mode_snapshot'] = $validated['layout_mode_snapshot'] ?? 'centered';
+            $cart['items'][$existingIndex]['is_custom_design'] = (bool) ($validated['is_custom_design'] ?? false);
+            $cart['items'][$existingIndex]['custom_design_token'] = $validated['custom_design_token'] ?? null;
+        } else {
+            $cart['items'][] = [
+                'id' => (string) Str::uuid(),
+                'product_id' => $validated['product_id'],
+                'color_id' => $validated['color_id'],
+                'color_name_snapshot' => $validated['color_name_snapshot'],
+                'design_id' => $validated['design_id'],
+                'design_name_snapshot' => $validated['design_name_snapshot'],
+                'design_image_id' => $validated['design_image_id'],
+                'design_image_path_snapshot' => $validated['design_image_path_snapshot'],
+                'layout_mode_snapshot' => $validated['layout_mode_snapshot'] ?? 'centered',
+                'is_custom_design' => (bool) ($validated['is_custom_design'] ?? false),
+                'custom_design_token' => $validated['custom_design_token'] ?? null,
+                'quantity' => $validated['quantity'],
+                'product_name_snapshot' => $validated['product_name_snapshot'],
+                'unit_price_snapshot' => $validated['unit_price_snapshot'],
+                'final_price' => $validated['final_price'],
+                'customization_json' => $validated['customization_json'],
+            ];
+        }
+
+        $this->store($cart['items']);
+
+        return $this->getCart();
+    }
+
+    public function removeItem(string $id): array
+    {
+        $cart = $this->getCart();
+        $cart['items'] = array_values(array_filter(
+            $cart['items'],
+            fn (array $item) => (string) ($item['id'] ?? '') !== $id
+        ));
+
+        $this->store($cart['items']);
+
+        return $this->getCart();
+    }
+
+    public function updateQuantity(string $id, int $quantity): array
+    {
+        if ($quantity < 1 || $quantity > self::MAX_QUANTITY) {
+            throw new InvalidArgumentException('Quantity must be between 1 and '.self::MAX_QUANTITY.'.');
+        }
+
+        $cart = $this->getCart();
+
+        foreach ($cart['items'] as $index => $item) {
+            if ((string) ($item['id'] ?? '') !== $id) {
+                continue;
+            }
+
+            $payload = [
+                'product_id' => (int) $item['product_id'],
+                'color_id' => isset($item['color_id']) && $item['color_id'] !== '' ? (int) $item['color_id'] : null,
+                'design_id' => isset($item['design_id']) && $item['design_id'] !== '' ? (int) $item['design_id'] : null,
+                'design_image_id' => isset($item['design_image_id']) && $item['design_image_id'] !== ''
+                    ? (int) $item['design_image_id']
+                    : null,
+                'is_custom_design' => (bool) ($item['is_custom_design'] ?? false),
+                'custom_design_token' => $item['custom_design_token'] ?? null,
+                'layout_mode' => $item['layout_mode_snapshot'] ?? 'centered',
+                'quantity' => $quantity,
+                'customization_json' => is_array($item['customization_json'] ?? null) ? $item['customization_json'] : [],
+            ];
+
+            $validated = $this->validatePayload($payload);
+
+            $cart['items'][$index]['quantity'] = $validated['quantity'];
+            $cart['items'][$index]['unit_price_snapshot'] = $validated['unit_price_snapshot'];
+            $cart['items'][$index]['final_price'] = $validated['final_price'];
+            $cart['items'][$index]['customization_json'] = $validated['customization_json'];
+            $cart['items'][$index]['product_name_snapshot'] = $validated['product_name_snapshot'];
+            $cart['items'][$index]['color_name_snapshot'] = $validated['color_name_snapshot'];
+            $cart['items'][$index]['design_name_snapshot'] = $validated['design_name_snapshot'];
+            $cart['items'][$index]['design_image_path_snapshot'] = $validated['design_image_path_snapshot'];
+            $cart['items'][$index]['layout_mode_snapshot'] = $validated['layout_mode_snapshot'] ?? 'centered';
+            $cart['items'][$index]['is_custom_design'] = (bool) ($validated['is_custom_design'] ?? false);
+            $cart['items'][$index]['custom_design_token'] = $validated['custom_design_token'] ?? null;
+
+            $this->store($cart['items']);
+
+            return $this->getCart();
+        }
+
+        throw new InvalidArgumentException('Cart item not found.');
+    }
+
+    public function clear(): array
+    {
+        session()->forget(self::SESSION_KEY);
+
+        return $this->getCart();
+    }
+
+    public function getValidatedCheckoutItems(bool $forUpdate = false): array
+    {
+        $cart = $this->getCart();
+
+        if (empty($cart['items'])) {
+            throw new InvalidArgumentException('Cart is empty.');
+        }
+
+        $validatedItems = [];
+        $items = $cart['items'];
+
+        foreach ($items as $index => $item) {
+            $validatedItems[] = $this->validatePayload([
+                'product_id' => (int) ($item['product_id'] ?? 0),
+                'color_id' => isset($item['color_id']) && $item['color_id'] !== '' ? (int) $item['color_id'] : null,
+                'design_id' => isset($item['design_id']) && $item['design_id'] !== '' ? (int) $item['design_id'] : null,
+                'design_image_id' => isset($item['design_image_id']) && $item['design_image_id'] !== ''
+                    ? (int) $item['design_image_id']
+                    : null,
+                'is_custom_design' => (bool) ($item['is_custom_design'] ?? false),
+                'custom_design_token' => $item['custom_design_token'] ?? null,
+                'layout_mode' => $item['layout_mode_snapshot'] ?? 'centered',
+                'quantity' => (int) ($item['quantity'] ?? 1),
+                'customization_json' => is_array($item['customization_json'] ?? null) ? $item['customization_json'] : [],
+            ], $forUpdate) + [
+                'id' => (string) ($item['id'] ?? Str::uuid()),
+            ];
+        }
+
+        $this->refreshStoredSnapshots($items, $validatedItems);
+
+        return $validatedItems;
+    }
+
+    /**
+     * Re-sync the cart session so the displayed snapshots (unit price, final
+     * price and human-readable labels) always reflect the authoritative rows.
+     * If any unit price drifted from the snapshot the customer saw, no order is
+     * created and the customer is asked to confirm the updated amount.
+     */
+    private function refreshStoredSnapshots(array $items, array $validatedItems): void
+    {
+        $priceChanged = false;
+
+        foreach ($items as $index => $item) {
+            $validated = $validatedItems[$index];
+
+            $items[$index]['unit_price_snapshot'] = (int) $validated['unit_price_snapshot'];
+            $items[$index]['final_price'] = (int) $validated['final_price'];
+            $items[$index]['product_name_snapshot'] = $validated['product_name_snapshot'];
+            $items[$index]['color_name_snapshot'] = $validated['color_name_snapshot'];
+            $items[$index]['design_name_snapshot'] = $validated['design_name_snapshot'];
+            $items[$index]['design_image_path_snapshot'] = $validated['design_image_path_snapshot'];
+            $items[$index]['layout_mode_snapshot'] = $validated['layout_mode_snapshot'] ?? 'centered';
+            $items[$index]['is_custom_design'] = (bool) ($validated['is_custom_design'] ?? false);
+            $items[$index]['custom_design_token'] = $validated['custom_design_token'] ?? null;
+
+            if ((int) ($item['unit_price_snapshot'] ?? 0) !== (int) $validated['unit_price_snapshot']) {
+                $priceChanged = true;
+            }
+        }
+
+        $this->store($items);
+
+        if ($priceChanged) {
+            throw new CartPriceChangedException(
+                'قیمت برخی از کالاهای سبد خرید تغییر کرده است؛ قیمت‌ها به‌روزرسانی شد. لطفاً مبلغ جدید را تأیید و دوباره ثبت سفارش را تکمیل کنید.'
+            );
+        }
+    }
+
+    public function createDraftOrder(array $customerData, ?int $userId = null, ?string $idempotencyToken = null): Order
+    {
+        for ($attempt = 1; $attempt <= 3; $attempt++) {
+            try {
+                return DB::transaction(function () use ($customerData, $userId, $idempotencyToken) {
+                    // A phone that belongs to a deactivated registered customer must
+                    // not become a new guest order; the account-status restriction
+                    // is enforced at the authoritative order-creation boundary for
+                    // guests. Authenticated requests are protected upstream by the
+                    // session-level account-status middleware.
+                    if ($userId === null) {
+                        $canonicalPhone = normalize_phone((string) ($customerData['customer_phone'] ?? ''));
+
+                        $blockedAccountExists = User::query()
+                            ->where('phone', $canonicalPhone)
+                            ->where('is_active', false)
+                            ->exists();
+
+                        if ($blockedAccountExists) {
+                            throw new InvalidArgumentException('امکان ثبت سفارش با این شماره وجود ندارد.');
+                        }
+                    }
+
+                    $validatedItems = $this->getValidatedCheckoutItems(true);
+
+                    $order = new Order;
+                    $order->user_id = $userId;
+                    $order->customer_name = $customerData['customer_name'];
+                    $order->customer_phone = normalize_phone((string) $customerData['customer_phone']);
+                    $order->shipping_address = $customerData['shipping_address'] ?? null;
+                    $order->shipping_postal_code = $customerData['shipping_postal_code'] ?? null;
+                    $order->shipping_plaque = $customerData['shipping_plaque'] ?? null;
+                    $order->shipping_description = $customerData['shipping_description'] ?? null;
+                    $order->token = $idempotencyToken;
+                    $order->status = OrderStatusEnum::PENDING;
+                    $order->payment_status = PaymentStatusEnum::UNPAID;
+                    $order->total_price = 0;
+                    $order->notes = $customerData['notes'] ?? null;
+                    $order->save();
+
+                    $total = 0;
+
+                    foreach ($validatedItems as $item) {
+                        $customization = is_array($item['customization_json'] ?? null)
+                            ? $item['customization_json']
+                            : [];
+
+                        $isCustomDesign = ! empty($item['is_custom_design']) || (! empty($item['custom_design_token']) && empty($item['design_id']));
+                        $itemUuid = (string) Str::uuid();
+                        $designImagePathSnapshot = $item['design_image_path_snapshot'];
+                        $layoutModeSnapshot = $item['layout_mode_snapshot'] ?? 'centered';
+
+                        if ($isCustomDesign && ! empty($item['custom_design_token'])) {
+                            $snapshotResult = app(CustomDesignService::class)->snapshotToOrder(
+                                (string) $item['custom_design_token'],
+                                $order,
+                                $itemUuid,
+                                $layoutModeSnapshot
+                            );
+                            $designImagePathSnapshot = $snapshotResult['design_image_path_snapshot'];
+                            $layoutModeSnapshot = $snapshotResult['layout_mode_snapshot'];
+                            $customization['custom_design'] = $snapshotResult['metadata'];
+
+                            // Clean up temporary design from session
+                            app(CustomDesignService::class)->removeTempDesign((string) $item['custom_design_token']);
+                        }
+
+                        if (($item['customization_workflow'] ?? null) === CustomizationWorkflowEnum::BANK_CARD->value) {
+                            if (! array_key_exists('is_scratched', $customization)) {
+                                $color = Color::query()->find($item['color_id']);
+                                $customization['is_scratched'] = (bool) ($color?->is_scratched ?? false);
+                            }
+
+                            if (! empty($item['design_image_id']) && empty($customization['design_color_name'])) {
+                                $designImage = DesignImage::query()->with('color')->find($item['design_image_id']);
+                                if ($designImage?->color) {
+                                    $customization['design_color_name'] = $designImage->color->name;
+                                    if ($designImage->color->code_hex) {
+                                        $customization['design_color_hex'] = $designImage->color->code_hex;
+                                    }
+                                }
+                            }
+                        }
+
+                        OrderItem::query()->create([
+                            'order_id' => $order->id,
+                            'product_id' => $item['product_id'],
+                            'customization_workflow' => $item['customization_workflow'],
+                            'product_name_snapshot' => $item['product_name_snapshot'],
+                            'color_id' => $item['color_id'],
+                            'color_name_snapshot' => $item['color_name_snapshot'],
+                            'design_id' => $item['design_id'],
+                            'design_name_snapshot' => $item['design_name_snapshot'],
+                            'design_image_id' => $item['design_image_id'],
+                            'design_image_path_snapshot' => $designImagePathSnapshot,
+                            'layout_mode_snapshot' => $layoutModeSnapshot,
+                            'unit_price_snapshot' => $item['unit_price_snapshot'],
+                            'quantity' => $item['quantity'],
+                            'final_price' => $item['final_price'],
+                            'customization_json' => $customization,
+                        ]);
+
+                        $total += (int) $item['final_price'];
+                    }
+
+                    $order->total_price = $total;
+                    $order->save();
+
+                    $this->clear();
+
+                    return $order;
+                });
+            } catch (UniqueConstraintViolationException $e) {
+                if ($attempt >= 3) {
+                    throw $e;
+                }
+
+                // Reference for this year may have just been taken by a concurrent
+                // checkout; regenerate it and retry once more.
+            }
+        }
+
+        throw new \LogicException('Unable to persist order after retries.');
+    }
+
+    private function validatePayload(array $payload, bool $forUpdate = false): array
+    {
+        $productId = (int) ($payload['product_id'] ?? 0);
+        $colorId = isset($payload['color_id']) && $payload['color_id'] !== '' ? (int) $payload['color_id'] : null;
+        $designId = isset($payload['design_id']) && $payload['design_id'] !== '' ? (int) $payload['design_id'] : null;
+        $designImageId = isset($payload['design_image_id']) && $payload['design_image_id'] !== ''
+            ? (int) $payload['design_image_id']
+            : null;
+        $quantity = (int) ($payload['quantity'] ?? 1);
+
+        if ($productId < 1) {
+            throw new InvalidArgumentException('Invalid product selection.');
+        }
+
+        if ($quantity < 1 || $quantity > self::MAX_QUANTITY) {
+            throw new InvalidArgumentException('Quantity must be between 1 and '.self::MAX_QUANTITY.'.');
+        }
+
+        $product = $this->lockForUpdate(Product::query()->active(), $forUpdate)->find($productId);
+
+        if (! $product) {
+            throw new InvalidArgumentException('Selected product is not available.');
+        }
+
+        $workflowRaw = $product->getRawOriginal('customization_workflow');
+        $workflow = $workflowRaw !== null ? CustomizationWorkflowEnum::tryFrom((string) $workflowRaw) : null;
+
+        if ($workflowRaw !== null && $workflow === null) {
+            throw new InvalidArgumentException('Selected product has an unsupported customization workflow.');
+        }
+
+        if ($workflow !== null && ! CustomizationWorkflowRegistry::isActive($workflow)) {
+            throw new InvalidArgumentException('Selected product customization is currently unavailable.');
+        }
+
+        if ($workflow === null) {
+            $validated = $this->validateCommercePayload($product, $colorId, $quantity, $forUpdate);
+        } else {
+            $validated = $this->validateCustomizationPayload($product, $workflow, $colorId, $designId, $designImageId, $quantity, $payload, $forUpdate);
+        }
+
+        $validated['customization_workflow'] = $workflow?->value;
+
+        return $validated;
+    }
+
+    private function validateCommercePayload($product, ?int $colorId, int $quantity, bool $forUpdate = false): array
+    {
+        $colorPrice = null;
+        $colorName = null;
+        $unitPrice = $product->base_price !== null ? (int) $product->base_price : null;
+
+        if ($colorId !== null) {
+            $colorPrice = $this->lockForUpdate(
+                ProductColorPrice::query()
+                    ->where('product_id', $product->id)
+                    ->where('color_id', $colorId)
+                    ->where('is_active', true)
+                    ->with(['color' => fn ($query) => $query->where('is_active', true)]),
+                $forUpdate
+            )->first();
+
+            if (! $colorPrice || ! $colorPrice->color) {
+                throw new InvalidArgumentException('Selected color is not valid for this product.');
+            }
+
+            $unitPrice = (int) $colorPrice->price;
+            $colorName = $colorPrice->color->name;
+        }
+
+        if ($unitPrice === null) {
+            throw new InvalidArgumentException('Selected product has no base price.');
+        }
+
+        return [
+            'product_id' => $product->id,
+            'color_id' => $colorId,
+            'color_name_snapshot' => $colorName,
+            'design_id' => null,
+            'design_name_snapshot' => null,
+            'design_image_id' => null,
+            'design_image_path_snapshot' => null,
+            'layout_mode_snapshot' => null,
+            'quantity' => $quantity,
+            'product_name_snapshot' => $product->name,
+            'unit_price_snapshot' => $unitPrice,
+            'final_price' => $unitPrice * $quantity,
+            'customization_json' => [],
+        ];
+    }
+
+    private function validateCustomizationPayload($product, CustomizationWorkflowEnum $workflow, ?int $clientColorId, ?int $designId, ?int $designImageId, int $quantity, array $payload, bool $forUpdate = false): array
+    {
+        $colorPrice = $workflow === CustomizationWorkflowEnum::FUEL_CARD
+            ? $this->resolveFuelColorPrice($product, $clientColorId, $forUpdate)
+            : $this->resolveSelectedColorPrice($product, $clientColorId, $forUpdate);
+
+        $isCustom = ! empty($payload['is_custom_design']) || ! empty($payload['custom_design_token']);
+
+        if ($isCustom) {
+            if ($workflow === CustomizationWorkflowEnum::FUEL_CARD) {
+                throw new InvalidArgumentException('امکان آپلود طرح اختصاصی برای کارت سوخت وجود ندارد.');
+            }
+
+            $validated = $this->resolveCustomDesignSnapshot($product, $colorPrice, $workflow, $quantity, $payload);
+        } else {
+            $validated = $this->resolveCustomizationSnapshot($product, $colorPrice, $designId, $designImageId, $quantity, $forUpdate);
+        }
+
+        $sanitizedCustomization = $this->sanitizeCustomization($workflow, $payload);
+        if ($workflow === CustomizationWorkflowEnum::BANK_CARD) {
+            $sanitizedCustomization['is_scratched'] = (bool) ($colorPrice->color?->is_scratched ?? false);
+        }
+
+        $validated['customization_json'] = $sanitizedCustomization;
+
+        return $validated;
+    }
+
+    private function resolveSelectedColorPrice($product, ?int $colorId, bool $forUpdate = false): ProductColorPrice
+    {
+        if ($colorId === null) {
+            throw new InvalidArgumentException('Invalid product/color/design selection.');
+        }
+
+        $colorPrice = $this->lockForUpdate(
+            ProductColorPrice::query()
+                ->where('product_id', $product->id)
+                ->where('color_id', $colorId)
+                ->where('is_active', true)
+                ->with(['color' => fn ($query) => $query->where('is_active', true)]),
+            $forUpdate
+        )->first();
+
+        if (! $colorPrice || ! $colorPrice->color) {
+            throw new InvalidArgumentException('Selected color is not valid for this product.');
+        }
+
+        return $colorPrice;
+    }
+
+    private function resolveFuelColorPrice($product, ?int $clientColorId, bool $forUpdate = false): ProductColorPrice
+    {
+        $activeRows = $this->lockForUpdate(
+            ProductColorPrice::query()
+                ->where('product_id', $product->id)
+                ->where('is_active', true)
+                ->with(['color' => fn ($query) => $query->where('is_active', true)]),
+            $forUpdate
+        )->get();
+
+        if ($activeRows->count() !== 1 || ! $activeRows->first()->color) {
+            throw new InvalidArgumentException('Fuel card products require exactly one active color.');
+        }
+
+        $colorPrice = $activeRows->first();
+
+        if ($clientColorId !== null && (int) $clientColorId !== (int) $colorPrice->color_id) {
+            throw new InvalidArgumentException('Selected color is not valid for this product.');
+        }
+
+        return $colorPrice;
+    }
+
+    private function resolveCustomDesignSnapshot($product, ProductColorPrice $colorPrice, CustomizationWorkflowEnum $workflow, int $quantity, array $payload): array
+    {
+        $token = (string) ($payload['custom_design_token'] ?? '');
+        $customDesign = app(CustomDesignService::class)->getTempDesign($token);
+
+        if (! $customDesign) {
+            throw new InvalidArgumentException('تصویر طرح اختصاصی یافت نشد یا منقضی شده است. لطفاً دوباره تصویر را بارگذاری کنید.');
+        }
+
+        if (($customDesign['workflow'] ?? null) !== $workflow->value) {
+            throw new InvalidArgumentException('طرح اختصاصی بارگذاری شده با نوع این کارت مطابقت ندارد.');
+        }
+
+        $rawLayout = (string) ($payload['layout_mode'] ?? $payload['layout_mode_snapshot'] ?? DesignImageLayoutModeEnum::CENTERED->value);
+        $layoutMode = in_array($rawLayout, [
+            DesignImageLayoutModeEnum::CENTERED->value,
+            DesignImageLayoutModeEnum::FULL_CARD->value,
+        ], true) ? $rawLayout : DesignImageLayoutModeEnum::CENTERED->value;
+
+        return [
+            'product_id' => $product->id,
+            'color_id' => $colorPrice->color_id,
+            'color_name_snapshot' => $colorPrice->color->name,
+            'design_id' => null,
+            'design_name_snapshot' => 'طرح اختصاصی مشتری',
+            'design_image_id' => null,
+            'design_image_path_snapshot' => $customDesign['path'],
+            'layout_mode_snapshot' => $layoutMode,
+            'is_custom_design' => true,
+            'custom_design_token' => $token,
+            'quantity' => $quantity,
+            'product_name_snapshot' => $product->name,
+            'unit_price_snapshot' => (int) $colorPrice->price,
+            'final_price' => (int) $colorPrice->price * $quantity,
+        ];
+    }
+
+    private function resolveCustomizationSnapshot($product, ProductColorPrice $colorPrice, ?int $designId, ?int $designImageId, int $quantity, bool $forUpdate = false): array
+    {
+        if ($designId === null) {
+            throw new InvalidArgumentException('Invalid product/color/design selection.');
+        }
+
+        $design = $this->lockForUpdate(
+            Design::query()
+                ->active()
+                ->whereRelation('category', fn ($query) => $query->where('is_active', true)),
+            $forUpdate
+        )->find($designId);
+
+        if (! $design) {
+            throw new InvalidArgumentException('Selected design is not available.');
+        }
+
+        $designImage = $this->lockForUpdate(DesignImage::query()->active(), $forUpdate)->find($designImageId);
+
+        if (! $designImage) {
+            throw new InvalidArgumentException('Selected design image is not available.');
+        }
+
+        if ((int) $designImage->design_id !== $designId) {
+            throw new InvalidArgumentException('Design image does not belong to selected design.');
+        }
+
+        $compatibility = $this->lockForUpdate(
+            DesignColorCompatibility::query()
+                ->where('design_image_id', $designImageId)
+                ->where('card_color_id', $colorPrice->color_id)
+                ->where('is_allowed', true),
+            $forUpdate
+        )->exists();
+
+        if (! $compatibility) {
+            throw new InvalidArgumentException('Selected design image is not compatible with selected color.');
+        }
+
+        return [
+            'product_id' => $product->id,
+            'color_id' => $colorPrice->color_id,
+            'color_name_snapshot' => $colorPrice->color->name,
+            'design_id' => $designId,
+            'design_name_snapshot' => $design->name,
+            'design_image_id' => $designImageId,
+            'design_image_path_snapshot' => $designImage?->image_path,
+            'layout_mode_snapshot' => $designImage?->getLayoutMode()->value ?? 'centered',
+            'quantity' => $quantity,
+            'product_name_snapshot' => $product->name,
+            'unit_price_snapshot' => (int) $colorPrice->price,
+            'final_price' => (int) $colorPrice->price * $quantity,
+        ];
+    }
+
+    private function lockForUpdate($query, bool $forUpdate)
+    {
+        if ($forUpdate && DB::getDriverName() === 'mysql') {
+            return $query->lockForUpdate();
+        }
+
+        return $query;
+    }
+
+    private function sanitizeCustomization(?CustomizationWorkflowEnum $workflow, array $payload): array
+    {
+        switch ($workflow) {
+            case CustomizationWorkflowEnum::BANK_CARD:
+                return BankCardCustomization::sanitize($payload);
+
+            case CustomizationWorkflowEnum::FUEL_CARD:
+                $sanitized = FuelCardCustomization::sanitize($payload);
+                if (! isset($sanitized['chip_info']) || ! in_array($sanitized['chip_info'], FuelCardCustomization::VALID_CHIP_SIZES, true)) {
+                    throw new InvalidArgumentException('Selecting a valid fuel card chip size (small or large) is required.');
+                }
+
+                return $sanitized;
+
+            default:
+                return [];
+        }
+    }
+
+    /**
+     * Locate an existing cart line that represents *exactly* the same purchase.
+     *
+     * A customized card line is identified by the catalog selection AND its
+     * customization payload. Two Fuel cards that share product, color, design
+     * and design image but carry different vehicle data (VIN, plate, owner,
+     * fuel system, chip size) are two different physical cards for two
+     * different vehicles: they must stay separate lines, because merging them
+     * would keep only one vehicle's fulfillment data while billing for both.
+     * Ordinary Store lines carry an empty payload and still merge as before.
+     */
+    private function findDuplicateItemIndex(array $items, array $validated): ?int
+    {
+        $identity = $this->cartIdentity($validated);
+
+        foreach ($items as $index => $item) {
+            if ($this->cartIdentity($item) === $identity) {
+                return $index;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Stable identity of a cart line.
+     *
+     * The customization payload is key-sorted first so two byte-identical
+     * payloads always produce the same identity regardless of the order their
+     * keys happened to be written in.
+     */
+    private function cartIdentity(array $line): string
+    {
+        return (string) json_encode([
+            'product_id' => (int) ($line['product_id'] ?? 0),
+            'color_id' => (int) ($line['color_id'] ?? 0),
+            'design_id' => (int) ($line['design_id'] ?? 0),
+            'design_image_id' => (int) ($line['design_image_id'] ?? 0),
+            'is_custom_design' => (bool) ($line['is_custom_design'] ?? false),
+            'custom_design_token' => (string) ($line['custom_design_token'] ?? ''),
+            'layout_mode' => (string) ($line['layout_mode_snapshot'] ?? 'centered'),
+            'customization' => $this->canonicalizeForIdentity($line['customization_json'] ?? []),
+        ], JSON_UNESCAPED_UNICODE);
+    }
+
+    private function canonicalizeForIdentity(mixed $value): mixed
+    {
+        if (! is_array($value)) {
+            return $value;
+        }
+
+        // pan_encrypted and cvv_encrypted ciphertext varies per call due to random IV.
+        // Omit them and rely on deterministic indexes for equality comparison.
+        unset($value['pan_encrypted'], $value['cvv_encrypted'], $value['cvv2_encrypted']);
+
+        ksort($value);
+
+        foreach ($value as $key => $item) {
+            $value[$key] = $this->canonicalizeForIdentity($item);
+        }
+
+        return $value;
+    }
+
+    private function store(array $items): void
+    {
+        session([self::SESSION_KEY => ['items' => array_values($items)]]);
+    }
+}

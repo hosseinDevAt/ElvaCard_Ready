@@ -1,0 +1,38 @@
+@extends('layouts.app')
+
+@section('title')طراحی کارت بانکی - {{ site_setting('site_name', config('app.name')) }}@endsection
+
+@section('meta')
+    <meta name="description" content="کارت بانکی خود را با طرح دلخواه‌تان طراحی کنید؛ رنگ، طرح و متن را انتخاب کرده و سفارش دهید.">
+    <link rel="canonical" href="{{ route('custom-card.bank') }}">
+@endsection
+
+@section('content')
+    <div class="min-h-screen bg-slate-50/60 py-8 sm:py-12">
+        <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+            <x-breadcrumbs :items="[
+                ['label' => 'طراحی کارت اختصاصی', 'url' => route('custom-card.design')],
+                ['label' => 'طراحی کارت بانکی']
+            ]" />
+
+            <div class="mb-6 flex flex-wrap items-center justify-between gap-4">
+                <div>
+                    <a href="{{ route('custom-card.design') }}" wire:navigate
+                       class="inline-flex items-center gap-1.5 text-xs font-bold text-slate-600 hover:text-[#010619] transition">
+                        <x-icons.arrow-right class="h-4 w-4" />
+                        <span>بازگشت به طراحی کارت اختصاصی</span>
+                    </a>
+                    <h1 class="mt-2 text-2xl font-black text-[#010619] sm:text-3xl">طراحی کارت بانکی</h1>
+                    <p class="mt-1 text-xs font-medium text-slate-500">{{ $product->name }}</p>
+                </div>
+            </div>
+
+            <livewire:catalog.product-customizer
+                :productId="$product->id"
+                :initialDesignSlug="$initialDesignSlug ?? null"
+                :initialColorId="$initialColorId ?? null"
+                :initialVariantId="$initialVariantId ?? null"
+            />
+        </div>
+    </div>
+@endsection

@@ -1,0 +1,52 @@
+<?php
+
+namespace App\Providers;
+
+use App\Services\IconManager;
+use App\Services\PaymentGatewayManager;
+use App\Support\Dates\DateService;
+use Illuminate\Contracts\Foundation\Application;
+use Illuminate\Contracts\View\View;
+use Illuminate\Support\Facades\View as ViewFacade;
+use Illuminate\Support\ServiceProvider;
+
+class AppServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        $this->app->singleton(PaymentGatewayManager::class, function (Application $app) {
+            return new PaymentGatewayManager($app, config('payments.gateways', []));
+        });
+
+        $this->app->singleton(IconManager::class, function (Application $app) {
+            return new IconManager(config('icons.slots', []), config('icons.variants', []));
+        });
+
+        $this->app->singleton(DateService::class, function (Application $app) {
+            return new DateService(config('dates.business_timezone', 'Asia/Tehran'));
+        });
+    }
+
+    public function boot(): void
+    {
+        $this->app->terminating(function (): void {
+            \App\Models\SiteSetting::clearRuntimeCache();
+            \App\Models\Menu::clearRuntimeCache();
+        });
+
+        \Illuminate\Support\Facades\Event::listen(\Illuminate\Cache\Events\KeyForgotten::class, function ($event): void {
+            if ($event->key === 'settings.public' || $event->key === 'laravel-cache-settings.public') {
+                \App\Models\SiteSetting::clearRuntimeCache();
+            }
+            if (str_contains($event->key, 'menus.location.')) {
+                \App\Models\Menu::clearRuntimeCache();
+            }
+        });
+
+        ViewFacade::composer('checkout.payment', function (View $view): void {
+            if (! $view->offsetExists('gateways')) {
+                $view->with('gateways', app(PaymentGatewayManager::class)->names());
+            }
+        });
+    }
+}

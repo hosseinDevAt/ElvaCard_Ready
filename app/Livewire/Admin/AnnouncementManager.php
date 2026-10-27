@@ -1,0 +1,227 @@
+<?php
+
+namespace App\Livewire\Admin;
+
+use App\Models\Announcement;
+use App\Support\Concerns\AuthorizesAdminActions;
+use App\Support\Dates\DateService;
+use Livewire\Component;
+use Livewire\WithPagination;
+
+class AnnouncementManager extends Component
+{
+    use AuthorizesAdminActions;
+    use WithPagination;
+
+    public string $search = '';
+
+    public string $title = '';
+
+    public string $content = '';
+
+    public ?string $link = null;
+
+    public ?string $backgroundColor = null;
+
+    public ?string $textColor = null;
+
+    public bool $isActive = true;
+
+    public int $sortOrder = 0;
+
+    public ?string $startDate = null;
+
+    public ?string $endDate = null;
+
+    public ?int $editingId = null;
+
+    public bool $showForm = false;
+
+    protected function rules(): array
+    {
+        return [
+            'title' => 'required|string|max:255',
+            'content' => 'required|string|min:1',
+            'link' => [
+                'nullable',
+                'string',
+                'max:2048',
+                function ($attribute, $value, $fail) {
+                    if ($value === null || trim($value) === '') {
+                        return;
+                    }
+
+                    $value = trim($value);
+
+                    if (str_starts_with(strtolower($value), '//')) {
+                        $fail('لینک پروتکل‌نسبی (//...) مجاز نیست.');
+
+                        return;
+                    }
+
+                    if (safe_url($value) === null) {
+                        $fail('لینک باید با http://، https:// یا / شروع شود.');
+                    }
+                },
+            ],
+            'backgroundColor' => 'nullable|string|max:100|regex:/^#[0-9A-Fa-f]{3}([0-9A-Fa-f]{3})?$/',
+            'textColor' => 'nullable|string|max:100|regex:/^#[0-9A-Fa-f]{3}([0-9A-Fa-f]{3})?$/',
+            'isActive' => 'boolean',
+            'sortOrder' => 'integer|min:0',
+            'startDate' => [
+                'nullable',
+                function ($attribute, $value, $fail) {
+                    if ($value === null || trim($value) === '') {
+                        return;
+                    }
+
+                    if (! app(DateService::class)->isValidDate($value)) {
+                        $fail('تاریخ شروع نامعتبر است.');
+                    }
+                },
+            ],
+            'endDate' => [
+                'nullable',
+                function ($attribute, $value, $fail) {
+                    if ($value === null || trim($value) === '') {
+                        return;
+                    }
+
+                    $dates = app(DateService::class);
+
+                    if (! $dates->isValidDate($value)) {
+                        $fail('تاریخ پایان نامعتبر است.');
+
+                        return;
+                    }
+
+                    if ($this->startDate === null || trim($this->startDate) === '' || ! $dates->isValidDate($this->startDate)) {
+                        $fail('تاریخ پایان بدون تاریخ شروع معتبر مجاز نیست.');
+
+                        return;
+                    }
+
+                    if ($dates->fromJalali($value)->lessThan($dates->fromJalali($this->startDate))) {
+                        $fail('تاریخ پایان باید بزرگ‌تر یا مساوی تاریخ شروع باشد.');
+                    }
+                },
+            ],
+        ];
+    }
+
+    public function updatedSearch(): void
+    {
+        $this->resetPage();
+    }
+
+    public function save(): void
+    {
+        $this->validate();
+
+        $dates = app(DateService::class);
+
+        $this->link = $this->link !== null && trim($this->link) !== '' ? trim($this->link) : null;
+        $this->backgroundColor = $this->backgroundColor !== null && trim($this->backgroundColor) !== '' ? trim($this->backgroundColor) : null;
+        $this->textColor = $this->textColor !== null && trim($this->textColor) !== '' ? trim($this->textColor) : null;
+        $this->startDate = $this->startDate !== null && trim($this->startDate) !== '' ? $this->startDate : null;
+        $this->endDate = $this->endDate !== null && trim($this->endDate) !== '' ? $this->endDate : null;
+
+        $data = [
+            'title' => $this->title,
+            'content' => $this->content,
+            'link' => $this->link,
+            'background_color' => $this->backgroundColor,
+            'text_color' => $this->textColor,
+            'is_active' => $this->isActive,
+            'sort_order' => $this->sortOrder,
+            'start_date' => $this->startDate !== null ? $dates->fromJalali($this->startDate) : null,
+            'end_date' => $this->endDate !== null ? $dates->fromJalali($this->endDate) : null,
+        ];
+
+        if ($this->editingId) {
+            $announcement = Announcement::find($this->editingId);
+
+            if (! $announcement) {
+                session()->flash('error', 'اطلاعیه موردنظر یافت نشد');
+
+                return;
+            }
+
+            $announcement->update($data);
+            session()->flash('success', 'اطلاعیه با موفقیت ویرایش شد');
+        } else {
+            Announcement::create($data);
+            session()->flash('success', 'اطلاعیه با موفقیت اضافه شد');
+        }
+
+        $this->resetForm();
+        $this->showForm = false;
+    }
+
+    public function edit(int $id): void
+    {
+        $announcement = Announcement::find($id);
+
+        if (! $announcement) {
+            session()->flash('error', 'اطلاعیه موردنظر یافت نشد');
+
+            return;
+        }
+
+        $dates = app(DateService::class);
+        $this->editingId = $id;
+        $this->title = $announcement->title;
+        $this->content = $announcement->content;
+        $this->link = $announcement->link;
+        $this->backgroundColor = $announcement->background_color;
+        $this->textColor = $announcement->text_color;
+        $this->isActive = $announcement->is_active;
+        $this->sortOrder = (int) $announcement->sort_order;
+        $this->startDate = $announcement->start_date ? $dates->ascii($dates->jDateTime($announcement->start_date)) : null;
+        $this->endDate = $announcement->end_date ? $dates->ascii($dates->jDateTime($announcement->end_date)) : null;
+        $this->showForm = true;
+    }
+
+    public function delete(int $id): void
+    {
+        $announcement = Announcement::find($id);
+
+        if (! $announcement) {
+            session()->flash('error', 'اطلاعیه موردنظر یافت نشد');
+
+            return;
+        }
+
+        $announcement->delete();
+        session()->flash('success', 'اطلاعیه با موفقیت حذف شد');
+    }
+
+    public function resetForm(): void
+    {
+        $this->title = '';
+        $this->content = '';
+        $this->link = null;
+        $this->backgroundColor = null;
+        $this->textColor = null;
+        $this->isActive = true;
+        $this->sortOrder = 0;
+        $this->startDate = null;
+        $this->endDate = null;
+        $this->editingId = null;
+    }
+
+    public function render()
+    {
+        return view('livewire.admin.announcement-manager', [
+            'announcements' => Announcement::query()
+                ->when($this->search !== '', function ($query) {
+                    $query->where(function ($sub) {
+                        $sub->where('title', 'like', "%{$this->search}%")
+                            ->orWhere('content', 'like', "%{$this->search}%");
+                    });
+                })
+                ->latest()
+                ->paginate(15),
+        ])->layout('layouts.admin')->title('مدیریت اطلاعیه‌ها');
+    }
+}

@@ -1,0 +1,398 @@
+<?php
+
+namespace App\Http\Controllers\Catalog;
+
+use App\Enums\CustomizationWorkflowEnum;
+use App\Enums\PaymentStatusEnum;
+use App\Enums\ProductTypeEnum;
+use App\Http\Controllers\Controller;
+use App\Models\CateDesign;
+use App\Models\Color;
+use App\Models\DesignColorCompatibility;
+use App\Models\Product;
+use App\Models\ProductCategory;
+use App\Models\ProductSlugHistory;
+use App\Services\Customization\CustomizationWorkflowRegistry;
+use App\Services\Customization\ProductPurchaseabilityService;
+use App\Services\DesignCatalogService;
+use Illuminate\Contracts\View\View;
+use Illuminate\Http\Request;
+
+class ProductCatalogController extends Controller
+{
+    public function index(Request $request): View
+    {
+        return view('catalog.products.index');
+    }
+
+    public function show(Request $request, string $slug)
+    {
+        $selectedColorId = $request->integer('color_id');
+
+        $product = Product::query()
+            ->active()
+            ->where('slug', $slug)
+            ->withCatalog()
+            ->with('images')
+            ->first();
+
+        if ($product === null) {
+            return $this->resolveHistoricalSlug($slug);
+        }
+
+        $workflowRaw = $product->getRawOriginal('customization_workflow');
+        $workflow = $workflowRaw !== null ? CustomizationWorkflowEnum::tryFrom((string) $workflowRaw) : null;
+        $hasCustomization = $workflowRaw !== null;
+        $customizationAvailable = $workflow !== null && CustomizationWorkflowRegistry::isActive($workflow);
+
+        // The storefront must never render a product the checkout cannot charge
+        // (broken price path, missing design path, broken fuel readiness). The
+        // only exception is the "not launched yet" amber state, which is itself
+        // a non-actionable page kept deliberately visible.
+        $purchasable = false;
+        if (! $hasCustomization || $customizationAvailable) {
+            $purchasable = ProductPurchaseabilityService::isPurchasable($product);
+            abort_unless($purchasable, 404);
+        }
+
+        $canonicalUrl = $this->canonicalUrl($product);
+
+        $similarProducts = Product::query()
+            ->active()
+            ->whereKeyNot($product->id)
+            ->whereNull('customization_workflow')
+            ->purchasable()
+            ->when($product->product_category_id, function ($q) use ($product) {
+                $q->where('product_category_id', $product->product_category_id);
+            })
+            ->with('category:id,name')
+            ->withCatalog()
+            ->take(4)
+            ->get();
+
+        if ($similarProducts->count() < 4) {
+            $moreProducts = Product::query()
+                ->active()
+                ->whereKeyNot($product->id)
+                ->whereNotIn('id', $similarProducts->pluck('id'))
+                ->whereNull('customization_workflow')
+                ->purchasable()
+                ->with('category:id,name')
+                ->withCatalog()
+                ->latest()
+                ->take(4 - $similarProducts->count())
+                ->get();
+            $similarProducts = $similarProducts->concat($moreProducts);
+        }
+
+        return view('catalog.products.show', [
+            'product' => $product,
+            'selectedColorId' => $selectedColorId,
+            'hasCustomization' => $hasCustomization,
+            'customizationAvailable' => $customizationAvailable,
+            'purchasable' => $purchasable,
+            'similarProducts' => $similarProducts,
+            'canonicalUrl' => $canonicalUrl,
+            'ogImageUrl' => $this->publicAssetUrl($product->og_image ?: $product->main_image),
+            'schemaJson' => $this->productSchemaJson($product, $purchasable, $canonicalUrl, $selectedColorId),
+        ]);
+    }
+
+    /**
+     * Old slugs keep their permanent reservation. Only an existing, active
+     * product may be the target of a 301; a deleted or deactivated product
+     * keeps its URLs dead (404) and never leaks onto another product.
+     */
+    private function resolveHistoricalSlug(string $slug)
+    {
+        $history = ProductSlugHistory::query()->where('slug', $slug)->first();
+
+        if ($history === null || $history->product_id === null) {
+            abort(404);
+        }
+
+        $product = Product::query()
+            ->active()
+            ->whereKey($history->product_id)
+            ->first();
+
+        if ($product === null || $product->slug === $slug) {
+            abort(404);
+        }
+
+        return redirect()->route('catalog.products.show', $product->slug, 301);
+    }
+
+    private function canonicalUrl(Product $product): string
+    {
+        $scheme = $product->canonical_url !== null && $product->canonical_url !== ''
+            ? parse_url($product->canonical_url, PHP_URL_SCHEME)
+            : null;
+
+        if (is_string($scheme) && in_array(strtolower($scheme), ['http', 'https'], true)) {
+            return $product->canonical_url;
+        }
+
+        return route('catalog.products.show', $product->slug);
+    }
+
+    private function publicAssetUrl(?string $path): ?string
+    {
+        if ($path === null || $path === '') {
+            return null;
+        }
+
+        $scheme = parse_url($path, PHP_URL_SCHEME);
+
+        if (is_string($scheme) && in_array(strtolower($scheme), ['http', 'https'], true)) {
+            return $path;
+        }
+
+        return asset('storage/'.ltrim($path, '/'));
+    }
+
+    private function productSchemaJson(Product $product, bool $purchasable, string $canonicalUrl, int $selectedColorId): string
+    {
+        $schema = [
+            '@context' => 'https://schema.org',
+            '@type' => 'Product',
+            'name' => $product->name,
+            'url' => $canonicalUrl,
+        ];
+
+        $description = $product->meta_description ?: $product->description;
+
+        if ($description !== null && $description !== '') {
+            $schema['description'] = $description;
+        }
+
+        $imageUrl = $this->productSchemaImage($product, $selectedColorId);
+
+        if ($imageUrl !== null) {
+            $schema['image'] = $imageUrl;
+        }
+
+        $offers = $this->productOffers($product, $purchasable);
+
+        if ($offers !== null) {
+            $schema['offers'] = $offers;
+        }
+
+        return json_encode(
+            $schema,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
+        );
+    }
+
+    /**
+     * A plain Store product's JSON-LD image is the image its Product Gallery
+     * actually presents for the current selection: the requested (or default)
+     * active color's images, else untinted images, else the legacy main image.
+     * Card products and products without any storefront gallery image keep the
+     * existing main_image/og_image fallback, so Bank/Fuel SEO stays untouched.
+     */
+    private function productSchemaImage(Product $product, int $selectedColorId): ?string
+    {
+        $hasWorkflow = $product->getRawOriginal('customization_workflow') !== null;
+
+        if ($hasWorkflow) {
+            return $this->publicAssetUrl($product->main_image ?: $product->og_image);
+        }
+
+        $colorId = $product->effectiveColorId($selectedColorId > 0 ? $selectedColorId : null);
+        $path = $product->galleryPaths($colorId)[0] ?? ($product->main_image ?: $product->og_image);
+
+        return $this->publicAssetUrl($path);
+    }
+
+    /**
+     * Prices are color-aware, so a single flat price would be misleading. The
+     * checkout charges the selected color price, or the base price when no
+     * color is chosen on a commerce product; card products always charge the
+     * color price. The structured data mirrors that truthful price set: one
+     * Offer for a single effective price, otherwise an AggregateOffer with the
+     * real low/high range of the buyable variants. Unpurchasable pages expose
+     * no offer at all.
+     */
+    private function productOffers(Product $product, bool $purchasable): ?array
+    {
+        if (! $purchasable) {
+            return null;
+        }
+
+        $prices = $product->colorPrices->pluck('price')->map(fn ($price) => (int) $price)->all();
+
+        if ($product->customization_workflow === null && $product->base_price !== null) {
+            $prices[] = (int) $product->base_price;
+        }
+
+        $prices = array_values(array_unique($prices));
+        sort($prices);
+
+        if ($prices === []) {
+            return null;
+        }
+
+        if (count($prices) === 1) {
+            return [
+                '@type' => 'Offer',
+                'price' => $prices[0],
+                'priceCurrency' => 'IRT',
+                'availability' => 'https://schema.org/InStock',
+            ];
+        }
+
+        return [
+            '@type' => 'AggregateOffer',
+            'lowPrice' => $prices[0],
+            'highPrice' => $prices[count($prices) - 1],
+            'priceCurrency' => 'IRT',
+            'offerCount' => count($prices),
+            'availability' => 'https://schema.org/InStock',
+        ];
+    }
+
+    public function designCatalog(Request $request): View
+    {
+        $selectedColorId = $request->integer('color_id');
+        $categorySlug = $request->query('category');
+
+        if ($categorySlug === 'popular-designs') {
+            return $this->popularDesigns($request);
+        }
+
+        $categoryId = null;
+        $selectedCategoryName = null;
+
+        if (is_string($categorySlug) && $categorySlug !== '') {
+            $category = CateDesign::query()
+                ->active()
+                ->where('slug', $categorySlug)
+                ->first(['id', 'name']);
+
+            if ($category) {
+                $categoryId = (int) $category->id;
+                $selectedCategoryName = $category->name;
+            }
+        }
+
+        $allowedImageIds = null;
+        if ($selectedColorId > 0) {
+            $allowedImageIds = DesignColorCompatibility::query()
+                ->where('card_color_id', $selectedColorId)
+                ->where('is_allowed', true)
+                ->pluck('design_image_id');
+        }
+
+        $catalog = app(DesignCatalogService::class)->paginatePublic(
+            $categoryId,
+            $selectedColorId > 0 ? $selectedColorId : null,
+            $allowedImageIds,
+        )->withQueryString();
+
+        return view('catalog.designs.index', [
+            'catalog' => $catalog,
+            'selectedColorId' => $selectedColorId > 0 ? $selectedColorId : null,
+            'selectedCategory' => $categorySlug,
+            'selectedCategoryName' => $selectedCategoryName,
+        ]);
+    }
+
+    public function popularDesigns(Request $request): View
+    {
+        $selectedColorId = $request->integer('color_id');
+        $categorySlug = $request->query('category');
+
+        $categoryId = null;
+        $selectedCategoryName = null;
+
+        if (is_string($categorySlug) && $categorySlug !== '' && $categorySlug !== 'popular-designs') {
+            $category = CateDesign::query()
+                ->active()
+                ->where('slug', $categorySlug)
+                ->first(['id', 'name']);
+
+            if ($category) {
+                $categoryId = (int) $category->id;
+                $selectedCategoryName = $category->name;
+            }
+        }
+
+        $allowedImageIds = null;
+        if ($selectedColorId > 0) {
+            $allowedImageIds = DesignColorCompatibility::query()
+                ->where('card_color_id', $selectedColorId)
+                ->where('is_allowed', true)
+                ->pluck('design_image_id');
+        }
+
+        $catalog = app(DesignCatalogService::class)->paginatePopularPublic(
+            $categoryId,
+            $selectedColorId > 0 ? $selectedColorId : null,
+            $allowedImageIds,
+        )->withQueryString();
+
+        return view('catalog.designs.popular', [
+            'catalog' => $catalog,
+            'selectedColorId' => $selectedColorId > 0 ? $selectedColorId : null,
+            'selectedCategory' => $categorySlug !== 'popular-designs' ? $categorySlug : null,
+            'selectedCategoryName' => $selectedCategoryName,
+        ]);
+    }
+
+    public function showDesign(Request $request, string $slug): View
+    {
+        if ($slug === 'popular') {
+            return $this->popularDesigns($request);
+        }
+
+        $service = app(DesignCatalogService::class);
+        $design = $service->findVisibleBySlug($slug);
+
+        if ($design === null) {
+            abort(404);
+        }
+
+        $design->load('category');
+
+        $variants = $service->validVariantsForDesign($design);
+
+        $selectedColorId = $request->integer('color_id');
+        $selectedVariant = null;
+
+        if ($selectedColorId > 0) {
+            $selectedVariant = $variants->first(fn ($v) => (int) ($v['color_id'] ?? 0) === $selectedColorId);
+        }
+
+        if ($selectedVariant === null && $variants->isNotEmpty()) {
+            $selectedVariant = $variants->first();
+        }
+
+        $canonicalUrl = $design->canonical_url && filter_var($design->canonical_url, FILTER_VALIDATE_URL)
+            ? $design->canonical_url
+            : route('catalog.designs.show', $design->slug);
+
+        $ogImageUrl = $selectedVariant && ! empty($selectedVariant['image_path'])
+            ? asset('storage/' . ltrim($selectedVariant['image_path'], '/'))
+            : null;
+
+        $schemaJson = json_encode(array_filter([
+            '@context' => 'https://schema.org',
+            '@type' => 'CreativeWork',
+            'name' => $design->name,
+            'description' => $design->meta_description ?: $design->description,
+            'url' => $canonicalUrl,
+            'image' => $ogImageUrl,
+        ]), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+        return view('catalog.designs.show', [
+            'design' => $design,
+            'variants' => $variants,
+            'selectedVariant' => $selectedVariant,
+            'selectedColorId' => $selectedVariant ? $selectedVariant['color_id'] : null,
+            'canonicalUrl' => $canonicalUrl,
+            'ogImageUrl' => $ogImageUrl,
+            'schemaJson' => $schemaJson,
+        ]);
+    }
+}

@@ -1,0 +1,46 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class ProductColorPrice extends Model
+{
+    protected $fillable = [
+        'product_id',
+        'color_id',
+        'price',
+        'is_active',
+    ];
+
+    protected $casts = [
+        'is_active' => 'boolean',
+    ];
+
+    public static function fuelActiveCount(int $productId, ?int $excludeId = null): int
+    {
+        return self::query()
+            ->where('product_id', $productId)
+            ->where('is_active', true)
+            ->when($excludeId, fn ($query) => $query->where('id', '!=', $excludeId))
+            ->count();
+    }
+
+    public function product()
+    {
+        return $this->belongsTo(Product::class);
+    }
+
+    public function color()
+    {
+        return $this->belongsTo(Color::class);
+    }
+
+    public function images()
+    {
+        return $this->hasMany(ProductImage::class, 'color_id', 'color_id')
+            ->where('product_id', $this->product_id)
+            ->orderBy('sort_order')
+            ->orderBy('id');
+    }
+}

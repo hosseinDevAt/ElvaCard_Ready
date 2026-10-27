@@ -1,0 +1,55 @@
+# Production Environment & Secrets
+.env
+.env.*
+!.env.example
+/auth.json
+
+# Dependencies (Installed via Composer on host)
+/vendor/
+/node_modules/
+
+# Local & SQLite Databases
+*.sqlite
+*.sqlite-journal
+*.sql
+*.sql.gz
+
+# Local Logs, Sessions, & Runtime Caches
+/storage/logs/*.log
+/storage/framework/cache/data/*
+/storage/framework/sessions/*
+/storage/framework/views/*
+!storage/framework/cache/.gitignore
+!storage/framework/sessions/.gitignore
+!storage/framework/views/.gitignore
+!storage/logs/.gitignore
+
+# Private User Data & Temporary Uploads
+/storage/app/private/*
+!storage/app/private/.gitignore
+/storage/app/emergency_binlogs_backup/
+/storage/app/public/livewire-tmp/*
+!storage/app/public/livewire-tmp/.gitignore
+
+# Development-only & Test Artifacts
+/qa_screenshots/
+/release_artifacts/
+/security_audit/
+/scratch/
+.phpunit.cache/
+.phpunit.result.cache
+
+# Vite Hot File & Host Symlink
+/public/hot
+/public/storage
+
+# System & Editor Files
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+Homestead.json
+Homestead.yaml
+npm-debug.log*
+yarn-error.log*
