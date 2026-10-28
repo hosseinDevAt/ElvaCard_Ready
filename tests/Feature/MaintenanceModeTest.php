@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+use App\Http\Middleware\CheckMaintenanceMode;
 use App\Livewire\Admin\SiteSettingManager;
 use App\Livewire\Auth\Login;
 use App\Models\Page;
@@ -10,7 +11,9 @@ use App\Models\User;
 use App\Services\MaintenanceModeManager;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Route;
 use Livewire\Livewire;
+use Livewire\Mechanisms\HandleRequests\EndpointResolver;
 use Tests\TestCase;
 
 class MaintenanceModeTest extends TestCase
@@ -313,5 +316,182 @@ class MaintenanceModeTest extends TestCase
         $response = $this->get('/');
         $this->assertSame(503, $response->getStatusCode());
         $this->assertFalse($response->isRedirection());
+    }
+
+    public function test_valid_auth_login_livewire_update_is_allowed_through_maintenance(): void
+    {
+        $this->manager->enable('test_actor');
+
+        $updatePath = EndpointResolver::updatePath();
+
+        $payload = [
+            'components' => [
+                [
+                    'snapshot' => json_encode([
+                        'memo' => [
+                            'name' => 'auth.login',
+                            'id' => 'comp-1',
+                        ],
+                        'data' => [
+                            'phone' => '09121111111',
+                            'password' => 'password',
+                        ],
+                    ]),
+                    'updates' => [],
+                    'calls' => [],
+                ],
+            ],
+        ];
+
+        // Should NOT be blocked with 503 by maintenance middleware
+        $response = $this->postJson($updatePath, $payload, [
+            'X-Livewire' => 'true',
+        ]);
+
+        $this->assertNotEquals(503, $response->getStatusCode());
+    }
+
+    public function test_auth_login_livewire_update_works_with_arbitrary_hashed_prefix(): void
+    {
+        $this->manager->enable('test_actor');
+
+        $customHashedPath = '/livewire-6e953cb4/update';
+
+        Route::post($customHashedPath, fn () => response()->json(['allowed' => true]))
+            ->middleware(['web', CheckMaintenanceMode::class]);
+
+        $payload = [
+            'components' => [
+                [
+                    'snapshot' => json_encode([
+                        'memo' => [
+                            'name' => 'auth.login',
+                            'id' => 'comp-auth',
+                        ],
+                        'data' => [],
+                    ]),
+                    'updates' => [],
+                    'calls' => [],
+                ],
+            ],
+        ];
+
+        // Must pass through CheckMaintenanceMode middleware without returning 503
+        $response = $this->postJson($customHashedPath, $payload, [
+            'X-Livewire' => 'true',
+        ]);
+
+        $response->assertOk();
+        $response->assertJson(['allowed' => true]);
+    }
+
+    public function test_ordinary_non_auth_livewire_update_is_blocked_with_503_for_guest(): void
+    {
+        $this->manager->enable('test_actor');
+
+        $updatePath = EndpointResolver::updatePath();
+
+        $payload = [
+            'components' => [
+                [
+                    'snapshot' => json_encode([
+                        'memo' => [
+                            'name' => 'catalog.product-catalog',
+                            'id' => 'comp-catalog',
+                        ],
+                        'data' => [],
+                    ]),
+                    'updates' => [],
+                    'calls' => [],
+                ],
+            ],
+        ];
+
+        // Must be blocked with 503 by CheckMaintenanceMode
+        $response = $this->postJson($updatePath, $payload, [
+            'X-Livewire' => 'true',
+        ]);
+
+        $response->assertStatus(503);
+
+        // Also test with arbitrary hashed prefix (e.g. production hash)
+        $hashedResponse = $this->postJson('/livewire-6e953cb4/update', $payload, [
+            'X-Livewire' => 'true',
+        ]);
+
+        $hashedResponse->assertStatus(503);
+    }
+
+    public function test_malformed_or_tampered_livewire_snapshots_are_blocked_with_503(): void
+    {
+        $this->manager->enable('test_actor');
+
+        $updatePath = EndpointResolver::updatePath();
+
+        // 1. Empty components array
+        $this->postJson($updatePath, ['components' => []])
+            ->assertStatus(503);
+
+        // 2. Non-array components
+        $this->postJson($updatePath, ['components' => 'invalid-string'])
+            ->assertStatus(503);
+
+        // 3. Component is not an array
+        $this->postJson($updatePath, ['components' => ['just a string']])
+            ->assertStatus(503);
+
+        // 4. Snapshot is invalid JSON
+        $this->postJson($updatePath, [
+            'components' => [
+                ['snapshot' => '{bad-json-syntax'],
+            ],
+        ])->assertStatus(503);
+
+        // 5. Snapshot missing memo.name
+        $this->postJson($updatePath, [
+            'components' => [
+                ['snapshot' => json_encode(['memo' => []])],
+            ],
+        ])->assertStatus(503);
+
+        // 6. Snapshot with empty component name
+        $this->postJson($updatePath, [
+            'components' => [
+                ['snapshot' => json_encode(['memo' => ['name' => '   ']])],
+            ],
+        ])->assertStatus(503);
+
+        // 7. Mixed components (one auth.login, one unauthorized non-auth component)
+        $mixedPayload = [
+            'components' => [
+                [
+                    'snapshot' => json_encode([
+                        'memo' => ['name' => 'auth.login'],
+                    ]),
+                ],
+                [
+                    'snapshot' => json_encode([
+                        'memo' => ['name' => 'admin.dashboard'],
+                    ]),
+                ],
+            ],
+        ];
+
+        $this->postJson($updatePath, $mixedPayload)
+            ->assertStatus(503);
+    }
+
+    public function test_livewire_assets_remain_accessible_via_dynamic_path(): void
+    {
+        $this->manager->enable('test_actor');
+
+        $scriptPath = EndpointResolver::scriptPath(true);
+
+        $response = $this->get($scriptPath);
+        $this->assertNotEquals(503, $response->getStatusCode());
+
+        // Also test arbitrary hashed livewire asset request
+        $hashedAssetResponse = $this->get('/livewire-6e953cb4/livewire.min.js');
+        $this->assertNotEquals(503, $hashedAssetResponse->getStatusCode());
     }
 }

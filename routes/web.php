@@ -142,4 +142,6 @@ Route::get('/faq', [FaqController::class, 'index'])->name('faq.index');
 
 require __DIR__.'/auth.php';
 
-Route::fallback(fn () => abort(404));
+Route::any('{fallbackPlaceholder}', fn () => abort(404))
+    ->where('fallbackPlaceholder', '.*')
+    ->fallback();

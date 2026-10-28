@@ -5,6 +5,7 @@ namespace App\Http\Middleware;
 use App\Services\MaintenanceModeManager;
 use Closure;
 use Illuminate\Http\Request;
+use Livewire\Mechanisms\HandleRequests\EndpointResolver;
 use Symfony\Component\HttpFoundation\Response;
 
 class CheckMaintenanceMode
@@ -35,19 +36,21 @@ class CheckMaintenanceMode
             return $next($request);
         }
 
-        // 4. Livewire endpoints
-        if ($request->is('livewire/*') || $request->is('livewire')) {
+        // 4. Livewire endpoints (including dynamic livewire-<hash>/update)
+        if ($this->isLivewireRequest($request)) {
             if ($request->isMethod('GET')) {
+                return $next($request);
+            }
+
+            if (app()->environment('testing') && ($request->is('livewire-test/*') || $request->is('_livewire-test/*'))) {
                 return $next($request);
             }
 
             if ($this->isAuthLivewireRequest($request)) {
                 return $next($request);
             }
-        }
 
-        if (app()->environment('testing') && ($request->is('livewire-test/*') || $request->is('_livewire-test/*'))) {
-            return $next($request);
+            return $this->maintenanceResponse($request);
         }
 
         // 5. Static assets and system health check
@@ -62,7 +65,96 @@ class CheckMaintenanceMode
             return $next($request);
         }
 
-        // 6. Return HTTP 503 Service Unavailable
+        // 6. Return HTTP 503 Service Unavailable for all other requests
+        return $this->maintenanceResponse($request);
+    }
+
+    protected function isLivewireRequest(Request $request): bool
+    {
+        // Named routes registered by Livewire
+        if ($request->routeIs('*livewire.update', 'livewire.update', 'default-livewire.update', 'livewire.upload-file', 'livewire.preview-file')) {
+            return true;
+        }
+
+        // Dynamic prefix resolution from installed Livewire 4 package
+        if (class_exists(EndpointResolver::class)) {
+            try {
+                $prefix = trim(EndpointResolver::prefix(), '/');
+                if ($prefix !== '' && ($request->is($prefix) || $request->is($prefix.'/*'))) {
+                    return true;
+                }
+            } catch (\Throwable) {
+                // Ignore and fallback to path matching
+            }
+        }
+
+        $path = trim($request->path(), '/');
+
+        // Standard Livewire prefix without hash
+        if ($path === 'livewire' || str_starts_with($path, 'livewire/')) {
+            return true;
+        }
+
+        // Livewire 4 dynamic hashed prefix (e.g. livewire-6e953cb4/update)
+        if (preg_match('#^livewire-[0-9a-zA-Z]+(/.*)?$#', $path)) {
+            return true;
+        }
+
+        // Testing environment test-runner routes
+        if (app()->environment('testing') && ($request->is('livewire-test/*') || $request->is('_livewire-test/*'))) {
+            return true;
+        }
+
+        return false;
+    }
+
+    protected function isAuthLivewireRequest(Request $request): bool
+    {
+        $components = $request->input('components');
+
+        if (! is_array($components) || empty($components)) {
+            return false;
+        }
+
+        $validCount = 0;
+
+        foreach ($components as $component) {
+            if (! is_array($component)) {
+                return false;
+            }
+
+            $snapshotRaw = $component['snapshot'] ?? null;
+            if (! is_string($snapshotRaw) || trim($snapshotRaw) === '') {
+                return false;
+            }
+
+            $snapshot = json_decode($snapshotRaw, true);
+            if (! is_array($snapshot) || json_last_error() !== JSON_ERROR_NONE) {
+                return false;
+            }
+
+            $memo = $snapshot['memo'] ?? null;
+            if (! is_array($memo)) {
+                return false;
+            }
+
+            $name = $memo['name'] ?? null;
+            if (! is_string($name) || trim($name) === '') {
+                return false;
+            }
+
+            if ($name !== 'auth.login' && ! str_starts_with($name, 'auth.')) {
+                return false;
+            }
+
+            $validCount++;
+        }
+
+        return $validCount > 0;
+    }
+
+    protected function maintenanceResponse(Request $request): Response
+    {
         if ($request->expectsJson() || $request->is('api/*')) {
             return response()->json([
                 'message' => 'سایت در حال حاضر در حال تعمیر و به‌روزرسانی است.',
@@ -74,29 +166,5 @@ class CheckMaintenanceMode
             'Pragma' => 'no-cache',
             'Expires' => '0',
         ]);
-    }
-
-    protected function isAuthLivewireRequest(Request $request): bool
-    {
-        $components = $request->input('components', []);
-
-        if (! is_array($components) || empty($components)) {
-            return false;
-        }
-
-        foreach ($components as $component) {
-            if (! is_array($component)) {
-                continue;
-            }
-            $snapshotRaw = $component['snapshot'] ?? '{}';
-            $snapshot = json_decode((string) $snapshotRaw, true);
-            $name = $snapshot['memo']['name'] ?? '';
-
-            if ($name !== 'auth.login' && ! str_starts_with((string) $name, 'auth.')) {
-                return false;
-            }
-        }
-
-        return true;
     }
 }
